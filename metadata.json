@@ -1,0 +1,6 @@
+{
+  "name": "Air Touchpad",
+  "description": "Use your webcam as an air touchpad! Move a simulated cursor with your index finger, perform calibration, and click/double-click on desktop and phone interfaces using advanced in-browser hand tracking.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
