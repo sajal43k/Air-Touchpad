@@ -53,6 +53,7 @@ export default function TouchpadControls({
   const lastClickTimeRef = useRef<number>(0);
   const scanProgressRef = useRef<number>(0);
   const animationFrameId = useRef<number | null>(null);
+  const wasTrackingLostRef = useRef<boolean>(true);
 
   // Helper to add logs
   const addLog = (text: string, type: 'info' | 'success' | 'action' | 'error' = 'info') => {
@@ -318,11 +319,12 @@ export default function TouchpadControls({
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    // If no multiHandLandmarks, hand is not detected
+    // 1. If no multiHandLandmarks, hand is not detected. Freeze cursor at its last valid position.
     if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
       if (handDetectedRef.current) {
         setHandDetected(false);
         setPinchActive(false);
+        wasTrackingLostRef.current = true;
         if (onPinchChangeRef.current) {
           onPinchChangeRef.current(false);
         }
@@ -335,10 +337,6 @@ export default function TouchpadControls({
       return;
     }
 
-    if (!handDetectedRef.current) {
-      setHandDetected(true);
-    }
-
     const landmarks = results.multiHandLandmarks[0];
 
     // Extract key landmarks
@@ -346,6 +344,28 @@ export default function TouchpadControls({
     const indexTip = landmarks[8];
     const indexMCP = landmarks[5];
     const wrist = landmarks[0];
+
+    // 2. Validate index finger tip and thumb tip landmarks
+    if (
+      !indexTip || indexTip.x === undefined || indexTip.y === undefined || isNaN(indexTip.x) || isNaN(indexTip.y) ||
+      !thumbTip || thumbTip.x === undefined || thumbTip.y === undefined || isNaN(thumbTip.x) || isNaN(thumbTip.y) ||
+      !indexMCP || !wrist
+    ) {
+      if (handDetectedRef.current) {
+        setHandDetected(false);
+        setPinchActive(false);
+        wasTrackingLostRef.current = true;
+        if (onPinchChangeRef.current) {
+          onPinchChangeRef.current(false);
+        }
+      }
+      return;
+    }
+
+    // Hand and finger landmarks are fully valid!
+    if (!handDetectedRef.current) {
+      setHandDetected(true);
+    }
 
     // Calculate dynamic hand size to normalize distances regardless of camera distance
     const handScale = Math.sqrt(
@@ -359,8 +379,19 @@ export default function TouchpadControls({
     const normalizedDistance = distance / (handScale || 1);
     setPinchDistance(Number(normalizedDistance.toFixed(3)));
 
-    // Pinch threshold is typically < 0.38
-    const isPinching = normalizedDistance < 0.38;
+    // 3. Robust Pinch gesture detection with dual-threshold hysteresis to avoid click bouncing
+    let isPinching = lastPinchRef.current;
+    if (isPinching) {
+      // Must release wider than 0.43 to click-up
+      if (normalizedDistance > 0.43) {
+        isPinching = false;
+      }
+    } else {
+      // Must pinch tighter than 0.35 to click-down
+      if (normalizedDistance < 0.35) {
+        isPinching = true;
+      }
+    }
     setPinchActive(isPinching);
 
     // Extract raw index finger coordinates
@@ -379,17 +410,33 @@ export default function TouchpadControls({
     targetX = centerOffset + (targetX - centerOffset) * sensitivityRef.current;
     targetY = centerOffset + (targetY - centerOffset) * sensitivityRef.current;
 
-    // Clamp coordinates
-    targetX = Math.max(0, Math.min(100, targetX));
-    targetY = Math.max(0, Math.min(100, targetY));
+    // 4. Ignore invalid values outside 0-100% touchpad boundary to prevent sudden border-jumping
+    if (targetX < 0 || targetX > 100 || targetY < 0 || targetY > 100) {
+      // Keep previous valid position and return (freeze)
+      return;
+    }
 
-    // Apply Exponential Moving Average (EMA) smoothing to eliminate camera jitter
+    // 5. Apply Exponential Moving Average (EMA) smoothing with initial snap and micro-deadband
+    if (wasTrackingLostRef.current) {
+      // Snap immediately to first valid coordinate after tracking is regained to prevent sliding jumps
+      lastPosRef.current = { x: targetX, y: targetY };
+      wasTrackingLostRef.current = false;
+    }
+
     const currentSmoothing = smoothingRef.current;
     const smoothX = lastPosRef.current.x * currentSmoothing + targetX * (1 - currentSmoothing);
     const smoothY = lastPosRef.current.y * currentSmoothing + targetY * (1 - currentSmoothing);
-    
-    const nextCoords = { x: smoothX, y: smoothY };
-    lastPosRef.current = nextCoords;
+
+    // Apply micro-deadband: Ignore very small changes to make stationary finger rock-solid
+    const deltaX = Math.abs(smoothX - lastPosRef.current.x);
+    const deltaY = Math.abs(smoothY - lastPosRef.current.y);
+    const microThreshold = 0.12; // 0.12% of touchpad area
+
+    let nextCoords = { ...lastPosRef.current };
+    if (deltaX > microThreshold || deltaY > microThreshold) {
+      nextCoords = { x: smoothX, y: smoothY };
+      lastPosRef.current = nextCoords;
+    }
 
     // STATE-SPECIFIC INTERACTION
     if (trackerStateRef.current === 'scanning') {
@@ -545,16 +592,22 @@ export default function TouchpadControls({
             <Fingerprint className="w-5 h-5 text-cyan-400" />
             <h2 className="font-display font-medium text-slate-200">Air Touchpad Control Panel</h2>
           </div>
-          <span className={`px-2 py-1 text-2xs font-mono rounded-full font-bold uppercase ${
-            trackerState === 'connected' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' :
-            trackerState === 'scanning' ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 animate-pulse' :
-            trackerState === 'ready' ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20' :
-            'bg-slate-800 text-slate-400'
+          <span className={`px-2.5 py-1 text-2xs font-mono rounded-full font-bold uppercase transition-all duration-300 flex items-center gap-1.5 ${
+            trackerState === 'connected'
+              ? handDetected
+                ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'
+                : 'bg-rose-500/10 text-rose-400 border border-rose-500/30 animate-pulse'
+              : trackerState === 'scanning' ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 animate-pulse' :
+              trackerState === 'ready' ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20' :
+              'bg-slate-800 text-slate-400'
           }`}>
-            {trackerState === 'connected' ? '● Live Air Touch' :
-             trackerState === 'scanning' ? '● Scanning Finger...' :
-             trackerState === 'ready' ? '● Camera Paused' :
-             '● Offline'}
+            {trackerState === 'connected'
+              ? handDetected
+                ? '● TRACKING ACTIVE'
+                : '▲ TRACKING LOST (FROZEN)'
+              : trackerState === 'scanning' ? '● Scanning Finger...' :
+               trackerState === 'ready' ? '● Camera Paused' :
+               '● Offline'}
           </span>
         </div>
       )}
@@ -721,9 +774,15 @@ export default function TouchpadControls({
               : 'bottom-3 left-3 px-2.5 py-1 text-2xs'
           }`}>
             {handDetected ? (
-              <span className="text-emerald-400">● {isMinimized ? 'Live Air' : 'Hand tracking active'}</span>
+              <span className="text-emerald-400 font-bold flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                {isMinimized ? 'ACTIVE' : 'TRACKING ACTIVE'}
+              </span>
             ) : (
-              <span className="text-rose-400 animate-pulse">▲ {isMinimized ? 'No hand' : 'Hand not in frame'}</span>
+              <span className="text-rose-400 font-bold flex items-center gap-1 animate-pulse">
+                <span className="w-1.5 h-1.5 rounded-full bg-rose-500"></span>
+                {isMinimized ? 'LOST' : 'TRACKING LOST (FROZEN)'}
+              </span>
             )}
           </div>
         )}
