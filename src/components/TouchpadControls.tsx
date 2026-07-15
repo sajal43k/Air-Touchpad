@@ -15,6 +15,7 @@ interface TouchpadControlsProps {
   onDoubleClick: () => void;
   onStreamReady?: (stream: MediaStream) => void;
   onPinchChange?: (pinching: boolean) => void;
+  onTrackingStatusChange?: (active: boolean) => void;
   isMinimized?: boolean;
 }
 
@@ -26,6 +27,7 @@ export default function TouchpadControls({
   onDoubleClick,
   onStreamReady,
   onPinchChange,
+  onTrackingStatusChange,
   isMinimized = false,
 }: TouchpadControlsProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -128,6 +130,7 @@ export default function TouchpadControls({
   const handDetectedRef = useRef<boolean>(handDetected);
   const onCursorMoveRef = useRef(onCursorMove);
   const onPinchChangeRef = useRef(onPinchChange);
+  const onTrackingStatusChangeRef = useRef(onTrackingStatusChange);
   const onSingleClickRef = useRef(onSingleClick);
   const onDoubleClickRef = useRef(onDoubleClick);
 
@@ -138,6 +141,7 @@ export default function TouchpadControls({
   useEffect(() => { handDetectedRef.current = handDetected; }, [handDetected]);
   useEffect(() => { onCursorMoveRef.current = onCursorMove; }, [onCursorMove]);
   useEffect(() => { onPinchChangeRef.current = onPinchChange; }, [onPinchChange]);
+  useEffect(() => { onTrackingStatusChangeRef.current = onTrackingStatusChange; }, [onTrackingStatusChange]);
   useEffect(() => { onSingleClickRef.current = onSingleClick; }, [onSingleClick]);
   useEffect(() => { onDoubleClickRef.current = onDoubleClick; }, [onDoubleClick]);
 
@@ -330,6 +334,9 @@ export default function TouchpadControls({
         if (onPinchChangeRef.current) {
           onPinchChangeRef.current(false);
         }
+        if (onTrackingStatusChangeRef.current) {
+          onTrackingStatusChangeRef.current(false);
+        }
       }
       // If scanning, slowly drain scan progress very gently
       if (trackerStateRef.current === 'scanning') {
@@ -360,6 +367,9 @@ export default function TouchpadControls({
         if (onPinchChangeRef.current) {
           onPinchChangeRef.current(false);
         }
+        if (onTrackingStatusChangeRef.current) {
+          onTrackingStatusChangeRef.current(false);
+        }
       }
       return;
     }
@@ -367,6 +377,9 @@ export default function TouchpadControls({
     // Hand and finger landmarks are fully valid!
     if (!handDetectedRef.current) {
       setHandDetected(true);
+      if (onTrackingStatusChangeRef.current) {
+        onTrackingStatusChangeRef.current(true);
+      }
     }
 
     // Get hand tracking confidence score

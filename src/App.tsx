@@ -130,10 +130,10 @@ export default function App() {
   const isPinchingRef = useRef<boolean>(false);
   isPinchingRef.current = isPinching;
 
-  const transmitCoordinates = (coords: Coordinates, click = false, doubleClick = false, dragging = false) => {
+  const transmitCoordinates = (coords: Coordinates, click = false, doubleClick = false, dragging = false, active = true) => {
     const now = Date.now();
-    // Throttle cursor movements to ~12ms (~83Hz) to maximize responsiveness, but allow click/dragging status packets to pass immediately
-    const isSpecialPacket = click || doubleClick || dragging !== lastSentDraggingRef.current;
+    // Throttle cursor movements to ~12ms (~83Hz) to maximize responsiveness, but allow click/dragging status/active packets to pass immediately
+    const isSpecialPacket = click || doubleClick || dragging !== lastSentDraggingRef.current || !active;
     if (now - lastSentRef.current < 12 && !isSpecialPacket) {
       return;
     }
@@ -149,7 +149,7 @@ export default function App() {
         click,
         doubleClick,
         dragging,
-        active: true,
+        active,
       }),
     }).catch(() => {});
   };
@@ -158,7 +158,15 @@ export default function App() {
   const handleLocalCursorMove = (coords: Coordinates, isDragging = false) => {
     setCursorPos(coords);
     if (currentRole === 'transmitter' || currentRole === 'standalone') {
-      transmitCoordinates(coords, false, false, isDragging);
+      transmitCoordinates(coords, false, false, isDragging, true);
+    }
+  };
+
+  // Handle hand tracking state transitions (active / inactive)
+  const handleTrackingStatusChange = (active: boolean) => {
+    addBridgeLog(active ? 'Hand detected - system tracking' : 'Hand tracking lost - releasing mouse control', active ? 'success' : 'info');
+    if (currentRole === 'transmitter' || currentRole === 'standalone') {
+      transmitCoordinates(cursorPos, false, false, false, active);
     }
   };
 
@@ -167,7 +175,7 @@ export default function App() {
     setClickTrigger((prev) => prev + 1);
     addBridgeLog('Local Pinch click registered.', 'action');
     if (currentRole === 'transmitter' || currentRole === 'standalone') {
-      transmitCoordinates(cursorPos, true, false, false);
+      transmitCoordinates(cursorPos, true, false, false, true);
     }
   };
 
@@ -175,7 +183,7 @@ export default function App() {
     setDoubleClickTrigger((prev) => prev + 1);
     addBridgeLog('Local Double-Pinch click registered.', 'success');
     if (currentRole === 'transmitter' || currentRole === 'standalone') {
-      transmitCoordinates(cursorPos, false, true, false);
+      transmitCoordinates(cursorPos, false, true, false, true);
     }
   };
 
@@ -227,7 +235,11 @@ print("Move your index finger to control this screen.")
 print("Press Ctrl+C inside this terminal to exit.")
 print("=====================================================")
 
-last_x, last_y = screen_width // 2, screen_height // 2
+# Initial cursor setup matching physical mouse location
+initial_pos_x, initial_pos_y = pyautogui.position()
+last_x, last_y = initial_pos_x, initial_pos_y
+last_moved_x, last_moved_y = initial_pos_x, initial_pos_y
+last_physical_move_time = 0.0
 is_mouse_down = False
 
 # CRITICAL LATENCY FIX: Use requests.Session() to enable TCP connection keep-alive
@@ -248,38 +260,73 @@ while True:
                 time.sleep(4.0)
                 continue
             
-            # Map 0-100 coordinates directly to your physical display coordinates
-            target_x = int((data["x"] / 100.0) * screen_width)
-            target_y = int((data["y"] / 100.0) * screen_height)
+            # Get the current physical mouse position
+            real_x, real_y = pyautogui.position()
             
-            # Highly responsive interpolation (0.15 smoothing / 0.85 snap) to minimize latency while keeping path stable
-            curr_x = int(last_x * 0.15 + target_x * 0.85)
-            curr_y = int(last_y * 0.15 + target_y * 0.85)
+            # Detect manual physical mouse/touchpad movement
+            # Uses a 4-pixel threshold to prevent false-positives from hardware micro-jitter
+            if abs(real_x - last_moved_x) > 4 or abs(real_y - last_moved_y) > 4:
+                last_physical_move_time = time.time()
+                # Snap our bridge coordinates immediately to prevent cursor jumping
+                last_x, last_y = real_x, real_y
+                last_moved_x, last_moved_y = real_x, real_y
+
+            is_active = data.get("active", False)
             
-            # Smoothly position physical mouse pointer
-            pyautogui.moveTo(curr_x, curr_y)
-            last_x, last_y = curr_x, curr_y
-            
-            # Handle continuous click-and-drag status
-            dragging = data.get("dragging", False)
-            if dragging:
-                if not is_mouse_down:
-                    pyautogui.mouseDown()
-                    is_mouse_down = True
-                    print("[Action] Mouse Down (Drag Start)")
+            if is_active:
+                # check if we are within the physical movement override cooldown (350ms lockout)
+                now_time = time.time()
+                if now_time - last_physical_move_time < 0.35:
+                    # User is physically using their touchpad. Snug state without fighting.
+                    last_x, last_y = real_x, real_y
+                    last_moved_x, last_moved_y = real_x, real_y
+                else:
+                    # Map 0-100 coordinates directly to your physical display coordinates
+                    target_x = int((data["x"] / 100.0) * screen_width)
+                    target_y = int((data["y"] / 100.0) * screen_height)
+                    
+                    # Highly responsive interpolation (0.15 smoothing / 0.85 snap) to minimize latency while keeping path stable
+                    curr_x = int(last_x * 0.15 + target_x * 0.85)
+                    curr_y = int(last_y * 0.15 + target_y * 0.85)
+                    
+                    # Smoothly position physical mouse pointer
+                    pyautogui.moveTo(curr_x, curr_y)
+                    
+                    # Store exact ending cursor location reported by OS (guards against acceleration, boundaries)
+                    actual_x, actual_y = pyautogui.position()
+                    last_x, last_y = curr_x, curr_y
+                    last_moved_x, last_moved_y = actual_x, actual_y
+                    
+                    # Handle continuous click-and-drag status
+                    dragging = data.get("dragging", False)
+                    if dragging:
+                        if not is_mouse_down:
+                            pyautogui.mouseDown()
+                            is_mouse_down = True
+                            print("[Action] Mouse Down (Drag Start)")
+                    else:
+                        if is_mouse_down:
+                            pyautogui.mouseUp()
+                            is_mouse_down = False
+                            print("[Action] Mouse Up (Drag End)")
+
+                    # Trigger OS hardware clicks based on browser hand gestures
+                    if data.get("click"):
+                        pyautogui.click()
+                        print("[Action] Single Click Executed")
+                    elif data.get("doubleClick"):
+                        pyautogui.doubleClick()
+                        print("[Action] Double Click Executed")
             else:
+                # No hand is tracked! Automatically yield 100% control to the physical touchpad
+                last_x, last_y = real_x, real_y
+                last_moved_x, last_moved_y = real_x, real_y
+                
+                # Make sure any active dragging clicks are released safely
                 if is_mouse_down:
                     pyautogui.mouseUp()
                     is_mouse_down = False
-                    print("[Action] Mouse Up (Drag End)")
-
-            # Trigger OS hardware clicks based on browser hand gestures
-            if data.get("click"):
-                pyautogui.click()
-                print("[Action] Single Click Executed")
-            elif data.get("doubleClick"):
-                pyautogui.doubleClick()
-                print("[Action] Double Click Executed")
+                    print("[System] Safe Release: Drag click-up on tracking lost")
                 
         # High sample rate (up to 100Hz) for near real-time tracking
         time.sleep(0.01)
@@ -405,6 +452,7 @@ while True:
             onDoubleClick={handleLocalDoubleClick}
             onStreamReady={setWebcamStream}
             onPinchChange={handlePinchChange}
+            onTrackingStatusChange={handleTrackingStatusChange}
           />
         </div>
 
