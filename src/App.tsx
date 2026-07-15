@@ -126,16 +126,19 @@ export default function App() {
   // 3. Post coordinates to API if we are in 'transmitter' mode or 'standalone' mode
   // Whenever coordinates or click triggers change, we transmit them so the Python script or receiver tab can capture them!
   const lastSentRef = useRef<number>(0);
+  const lastSentDraggingRef = useRef<boolean>(false);
   const isPinchingRef = useRef<boolean>(false);
   isPinchingRef.current = isPinching;
 
-  const transmitCoordinates = (coords: Coordinates, click = false, doubleClick = false) => {
+  const transmitCoordinates = (coords: Coordinates, click = false, doubleClick = false, dragging = false) => {
     const now = Date.now();
-    // Throttle cursor movements to ~30fps, but allow click packets to pass immediately
-    if (now - lastSentRef.current < 33 && !click && !doubleClick) {
+    // Throttle cursor movements to ~12ms (~83Hz) to maximize responsiveness, but allow click/dragging status packets to pass immediately
+    const isSpecialPacket = click || doubleClick || dragging !== lastSentDraggingRef.current;
+    if (now - lastSentRef.current < 12 && !isSpecialPacket) {
       return;
     }
     lastSentRef.current = now;
+    lastSentDraggingRef.current = dragging;
 
     fetch(`/api/coords?session=${sessionCode}`, {
       method: 'POST',
@@ -145,16 +148,17 @@ export default function App() {
         y: coords.y,
         click,
         doubleClick,
+        dragging,
         active: true,
       }),
     }).catch(() => {});
   };
 
   // Handle local cursor moves from webcam touchpad
-  const handleLocalCursorMove = (coords: Coordinates) => {
+  const handleLocalCursorMove = (coords: Coordinates, isDragging = false) => {
     setCursorPos(coords);
     if (currentRole === 'transmitter' || currentRole === 'standalone') {
-      transmitCoordinates(coords);
+      transmitCoordinates(coords, false, false, isDragging);
     }
   };
 
@@ -163,7 +167,7 @@ export default function App() {
     setClickTrigger((prev) => prev + 1);
     addBridgeLog('Local Pinch click registered.', 'action');
     if (currentRole === 'transmitter' || currentRole === 'standalone') {
-      transmitCoordinates(cursorPos, true, false);
+      transmitCoordinates(cursorPos, true, false, false);
     }
   };
 
@@ -171,7 +175,7 @@ export default function App() {
     setDoubleClickTrigger((prev) => prev + 1);
     addBridgeLog('Local Double-Pinch click registered.', 'success');
     if (currentRole === 'transmitter' || currentRole === 'standalone') {
-      transmitCoordinates(cursorPos, false, true);
+      transmitCoordinates(cursorPos, false, true, false);
     }
   };
 
@@ -206,6 +210,8 @@ SENSITIVITY = 1.0
 # ---------------------
 
 pyautogui.FAILSAFE = True
+# CRITICAL LATENCY FIX: Remove pyautogui's default 100ms artificial delay after each command
+pyautogui.PAUSE = 0.0
 screen_width, screen_height = pyautogui.size()
 
 headers = {}
@@ -222,11 +228,16 @@ print("Press Ctrl+C inside this terminal to exit.")
 print("=====================================================")
 
 last_x, last_y = screen_width // 2, screen_height // 2
+is_mouse_down = False
+
+# CRITICAL LATENCY FIX: Use requests.Session() to enable TCP connection keep-alive
+# This reduces HTTP request round-trip latency by up to 10x!
+client = requests.Session()
 
 while True:
     try:
         # Fetch the latest coordinate package from the browser cloud backend
-        response = requests.get(BRIDGE_URL, ${targetEnv === 'cloud' ? 'headers=headers, ' : ''}timeout=2)
+        response = client.get(BRIDGE_URL, ${targetEnv === 'cloud' ? 'headers=headers, ' : ''}timeout=1)
         if response.status_code == 200:
             try:
                 data = response.json()
@@ -241,14 +252,27 @@ while True:
             target_x = int((data["x"] / 100.0) * screen_width)
             target_y = int((data["y"] / 100.0) * screen_height)
             
-            # Linear interpolation smoothing
-            curr_x = int(last_x * 0.4 + target_x * 0.6)
-            curr_y = int(last_y * 0.4 + target_y * 0.6)
+            # Highly responsive interpolation (0.15 smoothing / 0.85 snap) to minimize latency while keeping path stable
+            curr_x = int(last_x * 0.15 + target_x * 0.85)
+            curr_y = int(last_y * 0.15 + target_y * 0.85)
             
             # Smoothly position physical mouse pointer
             pyautogui.moveTo(curr_x, curr_y)
             last_x, last_y = curr_x, curr_y
             
+            # Handle continuous click-and-drag status
+            dragging = data.get("dragging", False)
+            if dragging:
+                if not is_mouse_down:
+                    pyautogui.mouseDown()
+                    is_mouse_down = True
+                    print("[Action] Mouse Down (Drag Start)")
+            else:
+                if is_mouse_down:
+                    pyautogui.mouseUp()
+                    is_mouse_down = False
+                    print("[Action] Mouse Up (Drag End)")
+
             # Trigger OS hardware clicks based on browser hand gestures
             if data.get("click"):
                 pyautogui.click()
@@ -257,9 +281,12 @@ while True:
                 pyautogui.doubleClick()
                 print("[Action] Double Click Executed")
                 
-        time.sleep(0.035)  # ~30Hz sample rate to prevent CPU spikes
+        # High sample rate (up to 100Hz) for near real-time tracking
+        time.sleep(0.01)
         
     except KeyboardInterrupt:
+        if is_mouse_down:
+            pyautogui.mouseUp()
         print("\\nBridge terminated safely. Goodbye!")
         break
     except Exception as e:

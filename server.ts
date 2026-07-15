@@ -8,6 +8,7 @@ interface SessionState {
   y: number;
   click: boolean;
   doubleClick: boolean;
+  dragging: boolean;
   active: boolean;
   lastUpdated: number;
 }
@@ -22,13 +23,14 @@ app.use(express.json());
 // API endpoints
 app.post("/api/coords", (req, res) => {
   const session = (req.query.session as string || "default").toUpperCase();
-  const { x, y, click, doubleClick, active } = req.body;
+  const { x, y, click, doubleClick, dragging, active } = req.body;
   
   sessions[session] = {
     x: typeof x === "number" ? x : 50,
     y: typeof y === "number" ? y : 50,
     click: !!click,
     doubleClick: !!doubleClick,
+    dragging: !!dragging,
     active: !!active,
     lastUpdated: Date.now(),
   };
@@ -43,6 +45,7 @@ app.get("/api/coords", (req, res) => {
     y: 50,
     click: false,
     doubleClick: false,
+    dragging: false,
     active: false,
     lastUpdated: 0,
   };

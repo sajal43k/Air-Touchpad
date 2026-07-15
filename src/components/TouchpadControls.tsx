@@ -10,7 +10,7 @@ import { TrackerState, Coordinates } from '../types';
 interface TouchpadControlsProps {
   trackerState: TrackerState;
   setTrackerState: (state: TrackerState) => void;
-  onCursorMove: (coords: Coordinates) => void;
+  onCursorMove: (coords: Coordinates, isDragging?: boolean) => void;
   onSingleClick: () => void;
   onDoubleClick: () => void;
   onStreamReady?: (stream: MediaStream) => void;
@@ -37,7 +37,7 @@ export default function TouchpadControls({
   
   // Tracking parameters
   const [sensitivity, setSensitivity] = useState<number>(1.5); // 1.0 to 3.0
-  const [smoothing, setSmoothing] = useState<number>(0.75); // 0.0 to 0.95 (higher = smoother, lower = faster)
+  const [smoothing, setSmoothing] = useState<number>(0.35); // 0.0 to 0.95 (higher = smoother, lower = faster)
   const [isMirrored, setIsMirrored] = useState<boolean>(true);
   
   // Interactive stats shown in UI
@@ -54,6 +54,8 @@ export default function TouchpadControls({
   const scanProgressRef = useRef<number>(0);
   const animationFrameId = useRef<number | null>(null);
   const wasTrackingLostRef = useRef<boolean>(true);
+  const pinchStartRef = useRef<number | null>(null);
+  const isDraggingRef = useRef<boolean>(false);
 
   // Helper to add logs
   const addLog = (text: string, type: 'info' | 'success' | 'action' | 'error' = 'info') => {
@@ -229,7 +231,7 @@ export default function TouchpadControls({
 
       handsInstance.setOptions({
         maxNumHands: 1,
-        modelComplexity: 1,
+        modelComplexity: 0,
         minDetectionConfidence: 0.5,
         minTrackingConfidence: 0.5,
       });
@@ -367,10 +369,22 @@ export default function TouchpadControls({
       setHandDetected(true);
     }
 
+    // Get hand tracking confidence score
+    const confidence = results.multiHandedness?.[0]?.score ?? 1.0;
+    const isConfidenceHigh = confidence >= 0.70;
+
     // Calculate dynamic hand size to normalize distances regardless of camera distance
     const handScale = Math.sqrt(
       Math.pow(wrist.x - indexMCP.x, 2) + Math.pow(wrist.y - indexMCP.y, 2)
     );
+
+    // Calculate index finger extension normalized by hand size
+    const indexExtension = Math.sqrt(
+      Math.pow(indexTip.x - indexMCP.x, 2) + Math.pow(indexTip.y - indexMCP.y, 2)
+    ) / (handScale || 1);
+    
+    // We expect the index finger to be extended (uncurled index tip-to-knuckle distance is high)
+    const isIndexExtended = indexExtension > 0.50;
 
     // Calculate index to thumb distance
     const distance = Math.sqrt(
@@ -381,18 +395,60 @@ export default function TouchpadControls({
 
     // 3. Robust Pinch gesture detection with dual-threshold hysteresis to avoid click bouncing
     let isPinching = lastPinchRef.current;
-    if (isPinching) {
-      // Must release wider than 0.43 to click-up
-      if (normalizedDistance > 0.43) {
-        isPinching = false;
-      }
-    } else {
-      // Must pinch tighter than 0.35 to click-down
-      if (normalizedDistance < 0.35) {
-        isPinching = true;
+    
+    // Only recognize/change gestures when hand tracking confidence is high
+    if (isConfidenceHigh) {
+      if (isPinching) {
+        // Must release wider than 0.43 to click-up
+        if (normalizedDistance > 0.43) {
+          isPinching = false;
+        }
+      } else {
+        // Must pinch tighter than 0.35 to click-down
+        if (normalizedDistance < 0.35) {
+          isPinching = true;
+        }
       }
     }
     setPinchActive(isPinching);
+
+    // Track dragging state based on continuous pinch duration
+    if (isPinching) {
+      if (pinchStartRef.current === null) {
+        pinchStartRef.current = Date.now();
+      } else if (!isDraggingRef.current && (Date.now() - pinchStartRef.current > 250)) {
+        isDraggingRef.current = true;
+        addLog('Drag gesture active (holding pinch)', 'info');
+      }
+    } else {
+      pinchStartRef.current = null;
+    }
+
+    // Handle single and double click triggers on pinch release
+    let triggerSingleClick = false;
+    let triggerDoubleClick = false;
+
+    if (!isPinching && lastPinchRef.current) {
+      if (isDraggingRef.current) {
+        // Just released a click-and-drag gesture
+        isDraggingRef.current = false;
+        addLog('Drag gesture released', 'success');
+      } else if (isConfidenceHigh) {
+        // Release from a short pinch, process clicks
+        const now = Date.now();
+        const timeDiff = now - lastClickTimeRef.current;
+        
+        if (timeDiff < 400) {
+          triggerDoubleClick = true;
+          lastClickTimeRef.current = 0; // reset
+        } else {
+          triggerSingleClick = true;
+          lastClickTimeRef.current = now;
+        }
+      }
+    }
+
+    lastPinchRef.current = isPinching;
 
     // Extract raw index finger coordinates
     const rawX = isMirroredRef.current ? (1 - indexTip.x) : indexTip.x;
@@ -416,30 +472,18 @@ export default function TouchpadControls({
       return;
     }
 
-    // 5. Apply Exponential Moving Average (EMA) smoothing with initial snap and micro-deadband
-    if (wasTrackingLostRef.current) {
-      // Snap immediately to first valid coordinate after tracking is regained to prevent sliding jumps
-      lastPosRef.current = { x: targetX, y: targetY };
-      wasTrackingLostRef.current = false;
-    }
-
-    const currentSmoothing = smoothingRef.current;
-    const smoothX = lastPosRef.current.x * currentSmoothing + targetX * (1 - currentSmoothing);
-    const smoothY = lastPosRef.current.y * currentSmoothing + targetY * (1 - currentSmoothing);
-
-    // Apply micro-deadband: Ignore very small changes to make stationary finger rock-solid
-    const deltaX = Math.abs(smoothX - lastPosRef.current.x);
-    const deltaY = Math.abs(smoothY - lastPosRef.current.y);
-    const microThreshold = 0.12; // 0.12% of touchpad area
-
-    let nextCoords = { ...lastPosRef.current };
-    if (deltaX > microThreshold || deltaY > microThreshold) {
-      nextCoords = { x: smoothX, y: smoothY };
-      lastPosRef.current = nextCoords;
-    }
-
     // STATE-SPECIFIC INTERACTION
     if (trackerStateRef.current === 'scanning') {
+      // 5. Apply Exponential Moving Average (EMA) smoothing for scanning mode
+      if (wasTrackingLostRef.current) {
+        lastPosRef.current = { x: targetX, y: targetY };
+        wasTrackingLostRef.current = false;
+      }
+      const currentSmoothing = smoothingRef.current;
+      const smoothX = lastPosRef.current.x * currentSmoothing + targetX * (1 - currentSmoothing);
+      const smoothY = lastPosRef.current.y * currentSmoothing + targetY * (1 - currentSmoothing);
+      lastPosRef.current = { x: smoothX, y: smoothY };
+
       const targetNormalX = 0.5;
       const targetNormalY = 0.45;
 
@@ -464,42 +508,53 @@ export default function TouchpadControls({
         setScanProgress(Math.floor(scanProgressRef.current));
       }
     } else if (trackerStateRef.current === 'connected') {
+      // Only move the cursor when:
+      // Index finger is extended AND (thumb is open OR we are actively dragging)
+      const shouldMoveCursor = isIndexExtended && (!isPinching || isDraggingRef.current);
+      let nextCoords = { ...lastPosRef.current };
+
+      if (shouldMoveCursor) {
+        if (wasTrackingLostRef.current) {
+          // Snap immediately to first valid coordinate after tracking is regained to prevent sliding jumps
+          lastPosRef.current = { x: targetX, y: targetY };
+          wasTrackingLostRef.current = false;
+        }
+
+        const currentSmoothing = smoothingRef.current;
+        const smoothX = lastPosRef.current.x * currentSmoothing + targetX * (1 - currentSmoothing);
+        const smoothY = lastPosRef.current.y * currentSmoothing + targetY * (1 - currentSmoothing);
+
+        // Apply micro-deadband: Ignore very small changes to make stationary finger rock-solid
+        const deltaX = Math.abs(smoothX - lastPosRef.current.x);
+        const deltaY = Math.abs(smoothY - lastPosRef.current.y);
+        const microThreshold = 0.08; // 0.08% of touchpad area
+
+        if (deltaX > microThreshold || deltaY > microThreshold) {
+          nextCoords = { x: smoothX, y: smoothY };
+          lastPosRef.current = nextCoords;
+        }
+      }
+
       // Tracking is active! Report positions to parent
       if (onCursorMoveRef.current) {
-        onCursorMoveRef.current(nextCoords);
+        onCursorMoveRef.current(nextCoords, isDraggingRef.current);
       }
       if (onPinchChangeRef.current) {
         onPinchChangeRef.current(isPinching);
       }
 
       // Handle Pinch Gestures (Clicks & Double-clicks)
-      const previousPinch = lastPinchRef.current;
-      
-      if (isPinching && !previousPinch) {
-        // Pinch Down!
-        addLog('Pinch detected (Touchdown)', 'info');
-      } else if (!isPinching && previousPinch) {
-        // Pinch Up! (Release)
-        const now = Date.now();
-        const timeDiff = now - lastClickTimeRef.current;
-
-        if (timeDiff < 380) {
-          // Double click detected!
-          if (onDoubleClickRef.current) {
-            onDoubleClickRef.current();
-          }
-          addLog('⚡ Double-Click executed!', 'success');
-        } else {
-          // Single click detected
-          if (onSingleClickRef.current) {
-            onSingleClickRef.current();
-          }
-          addLog('🖱️ Click registered', 'action');
+      if (triggerDoubleClick) {
+        if (onDoubleClickRef.current) {
+          onDoubleClickRef.current();
         }
-        lastClickTimeRef.current = now;
+        addLog('⚡ Double-Click executed!', 'success');
+      } else if (triggerSingleClick) {
+        if (onSingleClickRef.current) {
+          onSingleClickRef.current();
+        }
+        addLog('🖱️ Click registered', 'action');
       }
-      
-      lastPinchRef.current = isPinching;
     }
   };
 
